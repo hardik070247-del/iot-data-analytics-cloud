@@ -1,0 +1,129 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: IoT Core -> Rule -> Kinesis Data Firehose -> Amazon Redshift (real-time analytics pipeline)
+
+Parameters:
+  RedshiftJdbcUrl:
+    Type: String
+    Description: e.g. jdbc:redshift://<workgroup>.<account>.<region>.redshift-serverless.amazonaws.com:5439/dev
+  RedshiftUser:
+    Type: String
+  RedshiftPassword:
+    Type: String
+    NoEcho: true
+  RedshiftTable:
+    Type: String
+    Default: iot_readings
+  TopicFilter:
+    Type: String
+    Default: iot/sensors/#
+
+Resources:
+  StagingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: firehose.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: staging-bucket-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt StagingBucket.Arn
+                  - !Sub '${StagingBucket.Arn}/*'
+
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: DirectPut
+      RedshiftDestinationConfiguration:
+        ClusterJDBCURL: !Ref RedshiftJdbcUrl
+        Username: !Ref RedshiftUser
+        Password: !Ref RedshiftPassword
+        RoleARN: !GetAtt FirehoseRole.Arn
+        CopyCommand:
+          DataTableName: !Ref RedshiftTable
+          CopyOptions: "json 'auto' timeformat 'auto'"
+        RetryOptions:
+          DurationInSeconds: 3600
+        S3Configuration:
+          BucketARN: !GetAtt StagingBucket.Arn
+          RoleARN: !GetAtt FirehoseRole.Arn
+          CompressionFormat: UNCOMPRESSED
+          BufferingHints:
+            IntervalInSeconds: 60
+            SizeInMBs: 1
+
+  IotRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: iot.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: put-to-firehose
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [firehose:PutRecord, firehose:PutRecordBatch]
+                Resource: !GetAtt DeliveryStream.Arn
+
+  TopicRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      TopicRulePayload:
+        Sql: !Sub "SELECT * FROM '${TopicFilter}'"
+        AwsIotSqlVersion: '2016-03-23'
+        RuleDisabled: false
+        Actions:
+          - Firehose:
+              DeliveryStreamName: !Ref DeliveryStream
+              RoleArn: !GetAtt IotRuleRole.Arn
+              Separator: "\n"
+
+  DevicePolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: iot-sim-device-policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: iot:Connect
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/iot-sim-*'
+          - Effect: Allow
+            Action: iot:Publish
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/iot/sensors/*'
+
+Outputs:
+  DeliveryStreamName:
+    Value: !Ref DeliveryStream
+  StagingBucketName:
+    Value: !Ref StagingBucket
+  DevicePolicyName:
+    Value: !Ref DevicePolicy
